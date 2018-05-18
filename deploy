@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+import os
+import time
+
+import docker
+import docopt
+import hvac
+import psycopg2
+
+
+config = {
+    'container': 'ebola-db',
+    'image': 'imperialebola2018/ebola-db:latest',
+    'volume': 'ebola-db-volume',
+    'root_user': 'postgres',
+    'database': 'postgres'
+}
+
+
+def get_client(cl):
+    return cl or docker.client.from_env()
+
+
+def get_volume(cl=None):
+    cl = get_client(cl)
+    try:
+        v = cl.volumes.get(config['volume'])
+    except docker.errors.NotFound:
+        v = cl.volumes.create(config['volume'])
+    return v
+
+
+def get_container(cl=None):
+    return get_client(cl).containers.get(config['container'])
+
+
+def get_vault():
+    print("Authenticating with the vault")
+    vault = hvac.Client(url='https://ebola2018.dide.ic.ac.uk:8200')
+    vault.auth_github(os.environ['VAULT_AUTH_GITHUB_TOKEN'])
+    return vault
+
+
+def connect(user, password):
+    conn_settings = {
+        "host": "localhost",
+        "port": 5432,
+        "name": config['database'],
+        "user": user,
+        "password": password
+    }
+    conn_string_template = "host='{host}' port='{port}' dbname='{name}' " + \
+                           "user='{user}' password='{password}'"
+    conn_string = conn_string_template.format(**conn_settings)
+    return psycopg2.connect(conn_string)
+
+
+def set_password(db, user, password):
+    db.execute("ALTER USER {user} WITH PASSWORD '{password}'".format(
+        user=user, password=password))
+
+
+def set_passwords(vault=None, container=None):
+    vault = vault or get_vault()
+    container = container or get_container()
+    users = vault.list("secret/database/users")['data']['keys']
+    pw = {u: vault.read("secret/database/users/{}".format(u))['data']['value']
+          for u in users}
+    root_user = config['root_user']
+    res = container.exec_run(["db-set-root-password", pw[root_user]])
+
+    for i in range(10):
+        ok = False
+        try:
+            with connect(root_user, pw[root_user]) as conn:
+                ok = True
+        except psycopg2.OperationalError:
+            print("...waiting")
+            time.sleep(1)
+    if not ok:
+        raise Exception("did not get database up properly")
+
+    with connect(root_user, pw[root_user]) as conn:
+        with conn.cursor() as cur:
+            for u, p in pw.items():
+                if u != root_user:
+                    set_password(cur, u, p)
+        conn.commit()
+
+
+
+def deploy(cl=None):
+    cl = get_client(cl)
+
+    try:
+        cl.containers.get(config['container'])
+        exists = True
+    except docker.errors.NotFound:
+        exists = False
+
+    if exists:
+        print("Already running")
+    else:
+        vault = get_vault()
+
+        print("Starting container")
+        v = get_volume(cl)
+        vols = {config['volume']: {'bind': '/pgdata', 'mode': 'rw'}}
+        container = cl.containers.run(image=config['image'],
+                                      ports={'5432/tcp': 5432},
+                                      volumes=vols,
+                                      name=config['container'],
+                                      detach=True,
+                                      remove=True)
+
+        print("Waiting for container")
+        res = container.exec_run("db-wait")
+        if res[0] != 0:
+            raise Exception("Error getting db started")
+
+        print("Setting passwords")
+        set_passwords(vault, container)
+
+
+if __name__ == "__main__":
+    deploy()

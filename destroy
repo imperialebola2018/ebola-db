@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+echo "don't run this"
+exit 1
+
+docker stop ebola-db
+docker volume rm ebola-db-volume
